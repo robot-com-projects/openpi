@@ -75,7 +75,7 @@ class I2RTInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class LiberoOutputs(transforms.DataTransformFn):
+class I2RTOutputs(transforms.DataTransformFn):
     """
     This class is used to convert outputs from the model back the the dataset specific format. It is
     used for inference only.

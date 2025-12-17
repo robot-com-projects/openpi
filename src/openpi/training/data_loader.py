@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -129,26 +129,106 @@ class FakeDataset(Dataset):
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
-) -> Dataset:
+) -> tuple[Dataset, _config.DataConfig]:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
-        return FakeDataset(model_config, num_samples=1024)
+        return FakeDataset(model_config, num_samples=1024), data_config
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    
+    # Determine the actual action key name from the dataset
+    # The dataset might have "action" (singular) but the config expects "actions" (plural)
+    # Check the dataset's column names to determine the correct action key
+    action_keys = list(data_config.action_sequence_keys)
+    actual_action_key = None
+    
+    # Try to get the dataset's column names to determine the correct action key
+    try:
+        # Create a temporary dataset to check column names
+        temp_dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id)
+        # Get column names from the underlying hf_dataset
+        available_columns = set(temp_dataset.hf_dataset.column_names)
+        
+        # If "actions" is not in the dataset but "action" is, use "action" instead
+        if "actions" not in available_columns and "action" in available_columns:
+            actual_action_key = "action"
+            action_keys = ["action" if key == "actions" else key for key in action_keys]
+            logging.info(f"Using 'action' instead of 'actions' for action_sequence_keys")
+        elif "actions" in available_columns:
+            actual_action_key = "actions"
+        else:
+            # Try to find any action-like column
+            for col in available_columns:
+                if "action" in col.lower():
+                    actual_action_key = col
+                    action_keys = [col if key in ("actions", "action") else key for key in action_keys]
+                    logging.info(f"Using '{col}' for action_sequence_keys")
+                    break
+    except Exception:
+        # If we can't check, just use the configured keys and let it fail with a clear error
+        pass
+    
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in action_keys
         },
     )
+    
+    # Update repack transforms if dataset uses "action" instead of "actions"
+    if actual_action_key == "action":
+        # Modify repack transforms to map from "action" to "actions"
+        updated_repack_transforms = []
+        for transform_group in data_config.repack_transforms.inputs:
+            if isinstance(transform_group, _transforms.RepackTransform):
+                # Update the structure to map "actions" (target) to "action" (source)
+                updated_structure = {}
+                for target_key, source_path in transform_group.structure.items():
+                    if target_key == "actions":
+                        # Change source to "action" if target is "actions"
+                        updated_structure[target_key] = "action"
+                    else:
+                        updated_structure[target_key] = source_path
+                updated_repack_transforms.append(_transforms.RepackTransform(updated_structure))
+            else:
+                updated_repack_transforms.append(transform_group)
+        # Create a new data_config with updated repack transforms
+        import dataclasses
+        data_config = dataclasses.replace(
+            data_config,
+            repack_transforms=_transforms.Group(inputs=updated_repack_transforms)
+        )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
-    return dataset
+        # Convert tasks to dict format if it's a DataFrame (v3.0 format)
+        import pandas as pd
+        if isinstance(dataset_meta.tasks, pd.DataFrame):
+            # It's a pandas DataFrame - convert to dict {task_index: task_string}
+            # In v3.0, the DataFrame has task strings as index and 'task_index' as a column
+            if 'task_index' in dataset_meta.tasks.columns:
+                # DataFrame structure: index=task_string, column=task_index
+                tasks_dict = {int(row['task_index']): str(idx) for idx, row in dataset_meta.tasks.iterrows()}
+            elif 'task' in dataset_meta.tasks.columns:
+                # DataFrame structure: has 'task' column, use index or 'task_index' column as key
+                if 'task_index' in dataset_meta.tasks.columns:
+                    tasks_dict = {int(row['task_index']): str(row['task']) for _, row in dataset_meta.tasks.iterrows()}
+                else:
+                    # Use DataFrame index as task_index
+                    tasks_dict = {int(idx): str(row['task']) for idx, row in dataset_meta.tasks.iterrows()}
+            else:
+                # Fallback: use index as key and first column as value
+                tasks_dict = {int(idx): str(val) for idx, val in dataset_meta.tasks.iloc[:, 0].items()}
+        elif isinstance(dataset_meta.tasks, dict):
+            tasks_dict = dataset_meta.tasks
+        else:
+            # Try to convert to dict
+            tasks_dict = dict(dataset_meta.tasks) if hasattr(dataset_meta.tasks, '__iter__') else {}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks_dict)])
+    
+    return dataset, data_config
 
 
 def create_rlds_dataset(
@@ -299,7 +379,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset, data_config = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
