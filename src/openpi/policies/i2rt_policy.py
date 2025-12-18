@@ -6,6 +6,15 @@ import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 
+def make_i2rt_example() -> dict:
+    """Creates a random input example for the Libero policy."""
+    return {
+        "observation/state": np.random.rand(14),
+        "observation/images/torso": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/images/teleop_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/images/teleop_right": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "prompt": "do something",
+    }
 
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
