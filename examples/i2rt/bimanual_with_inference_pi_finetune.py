@@ -177,7 +177,7 @@ class BimanualTeleopWithInference:
     Button 0: Toggle sync/unsync (teleoperation) - only in full_control mode
     Button 1: Toggle inference mode (only when unsynced) - only in full_control mode
     """
-    def __init__(self, config_name: str = "pi05_i2rt_lora", checkpoint_dir: str = "/home/i2rt/openpi/checkpoints/pi05_i2rt_lora/pi_lora_train/20000", bilateral_kp: float = 0.0, mode: str = "observation_only", sim: bool = False, mjcf_path: str = None, dataset_dir: str = None, episode_idx: int = 0, use_rerun: bool = False):
+    def __init__(self, config_name: str = "pi05_i2rt_lora", checkpoint_dir: str = "/home/i2rt/openpi/checkpoints/pi05_i2rt_lora/pi_lora_train/20000", bilateral_kp: float = 0.0, mode: str = "observation_only", sim: bool = False, mjcf_path: str = None, dataset_dir: str = None, episode_idx: int = 0, use_rerun: bool = False, max_actions_per_inference: int = None, execution_hz: float = 30.0, action_diff_threshold: float = 0.2):
         self.bilateral_kp = bilateral_kp
         self.mode = mode  # "observation_only" or "full_control"
         self.sim = sim
@@ -187,6 +187,10 @@ class BimanualTeleopWithInference:
         self.use_rerun = use_rerun and RERUN_AVAILABLE
         # Automatically enable plotting when in simulation mode
         self.plot_actions = sim and MATPLOTLIB_AVAILABLE
+        # Inference execution parameters
+        self.max_actions_per_inference = max_actions_per_inference
+        self.execution_hz = execution_hz
+        self.action_diff_threshold = action_diff_threshold
         
         # Store actions for plotting (always when in sim mode)
         if self.plot_actions:
@@ -309,8 +313,24 @@ class BimanualTeleopWithInference:
         self.action_buffer = []  # Stores actions from inference
         self.action_index = 0    # Tracks which action to execute next
         self.last_execution_time = 0  # For execution timing
-        self.actions_per_inference = 12  # Number of actions to execute before next inference
-        self.execution_hz = 66  # Execution frequency
+        
+        # Set default max_actions_per_inference if not provided
+        # Default to action_horizon from policy config, or 12 if not available
+        if self.max_actions_per_inference is None:
+            try:
+                # Try to get action_horizon from policy config
+                action_horizon = getattr(self.policy, 'action_horizon', None)
+                if action_horizon is None:
+                    # Try to get from model config
+                    if hasattr(self.policy, 'config'):
+                        action_horizon = getattr(self.policy.config, 'action_horizon', 12)
+                    else:
+                        action_horizon = 12
+                self.max_actions_per_inference = action_horizon
+            except Exception:
+                self.max_actions_per_inference = 12
+        
+        print(f"Inference parameters: max_actions_per_inference={self.max_actions_per_inference}, execution_hz={self.execution_hz}, action_diff_threshold={self.action_diff_threshold}")
 
     def connect_inference_robot(self):
         """Connect the inference robot to read observations"""
@@ -461,12 +481,11 @@ class BimanualTeleopWithInference:
         follower_pos_right = self.follower_right.get_joint_pos()
         follower_pos_left = self.follower_left.get_joint_pos()
         
-        # Limit target and current positions difference to 0.08 radians
+        # Limit target and current positions difference using action_diff_threshold
         diff_right = target_right - follower_pos_right
         diff_left = target_left - follower_pos_left
-        diff_threshold = 0.3
-        diff_right = np.clip(diff_right, -diff_threshold, diff_threshold)
-        diff_left = np.clip(diff_left, -diff_threshold, diff_threshold)
+        diff_right = np.clip(diff_right, -self.action_diff_threshold, self.action_diff_threshold)
+        diff_left = np.clip(diff_left, -self.action_diff_threshold, self.action_diff_threshold)
         target_right = follower_pos_right + diff_right
         target_left = follower_pos_left + diff_left
         
@@ -487,7 +506,9 @@ class BimanualTeleopWithInference:
         current_time = time.time()
         
         # Check if we need to run inference (buffer empty or executed required actions)
-        need_inference = len(self.action_buffer) == 0 or self.action_index >= self.actions_per_inference
+        actions_available = len(self.action_buffer)
+        actions_limit = min(self.max_actions_per_inference, actions_available) if actions_available else 0
+        need_inference = actions_available == 0 or self.action_index >= actions_limit
         
         if need_inference:
             print(f"\n{'='*60}")
@@ -558,17 +579,20 @@ class BimanualTeleopWithInference:
             # Get current action from buffer
             current_action = self.action_buffer[self.action_index]
             
+            actions_limit = min(self.max_actions_per_inference, len(self.action_buffer))
+            if actions_limit == 0 or self.action_index >= actions_limit:
+                return
+            
+            # Get current action from buffer
+            current_action = self.action_buffer[self.action_index]
+            
             # Execute or print the action (depending on mode)
-            if self.mode == "observation_only":
-                print(f"\n[Action {self.action_index + 1}/{self.actions_per_inference}]")
             self.execute_inference_action(current_action)
             
             # Update state
             self.action_index += 1
-            
-            elapsed = current_time - self.last_execution_time if self.last_execution_time > 0 else 0
-            fps = 1.0 / elapsed if elapsed > 0 else 0
-            print(f"  Rate: {fps:.2f} Hz")
+            fps = 1.0 / time_since_last_execution if time_since_last_execution > 0 else float("inf")
+            print(f"Executed action {self.action_index}/{actions_limit} | fps: {fps:.2f}")
             self.last_execution_time = current_time
 
     def run_simulation_inference(self):
@@ -654,7 +678,8 @@ class BimanualTeleopWithInference:
             example['prompt'] = "Fold the shirt"
         
         # Run inference if needed
-        if len(self.sim_action_buffer) == 0 or self.sim_action_index >= self.actions_per_inference:
+        actions_limit = min(self.max_actions_per_inference, len(self.sim_action_buffer)) if len(self.sim_action_buffer) > 0 else 0
+        if len(self.sim_action_buffer) == 0 or self.sim_action_index >= actions_limit:
             print(f"\n{'='*60}")
             print(f"Running inference (sim_frame_idx={self.sim_frame_idx})...")
             
@@ -897,6 +922,12 @@ def main():
                         help='Episode index to replay (default: 0)')
     parser.add_argument('--use_rerun', action='store_true',
                         help='Use Rerun for visualization (requires rerun package)')
+    parser.add_argument('--max-actions-per-inference', type=int, default=None,
+                        help='Limit how many actions from each inference chunk are executed before next inference (default: None = use action_horizon from policy config). Use smaller values (e.g., 10-20) for more frequent inference if robot gets stuck.')
+    parser.add_argument('--execution-hz', type=float, default=30.0,
+                        help='Follower command frequency during inference (should match training frequency, default: 30 Hz). Using different frequency can cause robot to get stuck.')
+    parser.add_argument('--action-diff-threshold', type=float, default=0.2,
+                        help='Maximum change per action step in radians (limits how fast robot can move, default: 0.2). Increase if robot moves too slowly, decrease if unstable.')
     args = parser.parse_args()
     
     mode = args.mode
@@ -965,6 +996,9 @@ def main():
             dataset_dir=args.dataset_dir,
             episode_idx=args.episode_idx,
             use_rerun=args.use_rerun,
+            max_actions_per_inference=args.max_actions_per_inference,
+            execution_hz=args.execution_hz,
+            action_diff_threshold=args.action_diff_threshold,
         )
 
         # Run main control loop
