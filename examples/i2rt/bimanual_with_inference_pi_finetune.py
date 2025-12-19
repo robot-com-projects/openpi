@@ -12,6 +12,31 @@ import yaml
 import os
 import numpy as np
 import signal
+from pathlib import Path
+
+# Optional imports for simulation
+try:
+    import mujoco
+    MUJOCO_AVAILABLE = True
+except ImportError:
+    MUJOCO_AVAILABLE = False
+    print("Warning: mujoco not available. Simulation will be disabled.")
+
+try:
+    import rerun as rr
+    RERUN_AVAILABLE = True
+except ImportError:
+    RERUN_AVAILABLE = False
+    print("Warning: rerun not available. Visualization will be limited.")
+
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("Warning: matplotlib not available. Plotting will be disabled.")
+
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # Compute paths relative to this file's location
 current_file_path = os.path.dirname(os.path.abspath(__file__))
@@ -152,15 +177,40 @@ class BimanualTeleopWithInference:
     Button 0: Toggle sync/unsync (teleoperation) - only in full_control mode
     Button 1: Toggle inference mode (only when unsynced) - only in full_control mode
     """
-    def __init__(self, config_name: str = "pi05_i2rt_lora", checkpoint_dir: str = "/home/i2rt/openpi/checkpoints/pi05_i2rt_lora/pi_lora_train/20000", bilateral_kp: float = 0.0, mode: str = "observation_only"):
+    def __init__(self, config_name: str = "pi05_i2rt_lora", checkpoint_dir: str = "/home/i2rt/openpi/checkpoints/pi05_i2rt_lora/pi_lora_train/20000", bilateral_kp: float = 0.0, mode: str = "observation_only", sim: bool = False, mjcf_path: str = None, dataset_dir: str = None, episode_idx: int = 0, use_rerun: bool = False):
         self.bilateral_kp = bilateral_kp
         self.mode = mode  # "observation_only" or "full_control"
+        self.sim = sim
+        self.mjcf_path = mjcf_path
+        self.dataset_dir = dataset_dir
+        self.episode_idx = episode_idx
+        self.use_rerun = use_rerun and RERUN_AVAILABLE
+        # Automatically enable plotting when in simulation mode
+        self.plot_actions = sim and MATPLOTLIB_AVAILABLE
+        
+        # Store actions for plotting (always when in sim mode)
+        if self.plot_actions:
+            self.predicted_actions = []
+            self.ground_truth_actions = []
+            self.action_timestamps = []
+            # Create plots directory
+            self.plots_dir = Path("action_plots")
+            self.plots_dir.mkdir(exist_ok=True)
+            print(f"Action plots will be saved to: {self.plots_dir.absolute()}")
         
         if self.mode not in ["observation_only", "full_control"]:
             raise ValueError(f"Invalid mode: {self.mode}. Must be 'observation_only' or 'full_control'")
         
         print(f"Running in mode: {self.mode}")
-        if self.mode == "observation_only":
+        if self.sim:
+            print("  - Simulation mode: Will replay episode in MuJoCo")
+            if not MUJOCO_AVAILABLE:
+                raise ImportError("MuJoCo is not available. Install with: pip install mujoco")
+            if self.mjcf_path is None or not Path(self.mjcf_path).exists():
+                raise FileNotFoundError(f"MuJoCo XML file not found at {self.mjcf_path}")
+            if self.dataset_dir is None:
+                raise ValueError("--dataset_dir is required when --sim is enabled")
+        elif self.mode == "observation_only":
             print("  - Observation-only mode: Will receive observations, run inference, and print actions (NO ACTUATION)")
         else:
             print("  - Full control mode: Will actuate robots based on button controls and inference")
@@ -180,11 +230,55 @@ class BimanualTeleopWithInference:
         self.policy = _policy_config.create_trained_policy(config, checkpoint_dir)
         print("✓ Inference model loaded successfully")
 
-        # REAL ROBOT SETUP
-        robot_cfg = I2RTFollowerConfig()
-        self.inference_robot = I2RTRobot(robot_cfg)
-        self.inference_robot.connect()
-        print("Inference robot connected!")
+        # REAL ROBOT SETUP (skip if in simulation mode)
+        if not self.sim:
+            robot_cfg = I2RTFollowerConfig()
+            self.inference_robot = I2RTRobot(robot_cfg)
+            self.inference_robot.connect()
+            print("Inference robot connected!")
+        else:
+            self.inference_robot = None
+            # Load MuJoCo model for simulation
+            self.mj_model = mujoco.MjModel.from_xml_path(str(self.mjcf_path))
+            self.mj_data = mujoco.MjData(self.mj_model)
+            # Don't initialize renderer - we don't need it for simulation replay
+            # (Renderer requires display/OpenGL which may not be available in headless environments)
+            self.mj_renderer = None
+            self.use_renderer = False
+            print(f"MuJoCo model loaded from: {self.mjcf_path}")
+            
+            # Load dataset for simulation
+            print(f"Loading dataset from: {self.dataset_dir}")
+            # Try to resolve repo_id and root
+            if os.path.isdir(self.dataset_dir):
+                # Local directory
+                repo_id = os.path.basename(self.dataset_dir)
+                root = self.dataset_dir
+            else:
+                # Assume it's a repo_id
+                repo_id = self.dataset_dir
+                root = None
+            self.sim_dataset = LeRobotDataset(repo_id=repo_id, root=root, episodes=[self.episode_idx])
+            print(f"Dataset loaded: episode {self.episode_idx}")
+            
+            # Get episode metadata
+            episode_meta = self.sim_dataset.meta.episodes[self.episode_idx]
+            self.sim_from_idx = int(float(episode_meta["dataset_from_index"]))
+            self.sim_to_idx = int(float(episode_meta["dataset_to_index"]))
+            self.sim_fps = float(self.sim_dataset.meta.fps)
+            self.sim_dt = self.mj_model.opt.timestep
+            print(f"Episode range: {self.sim_from_idx} to {self.sim_to_idx}")
+            print(f"Dataset FPS: {self.sim_fps}")
+            
+            # Simulation state
+            self.sim_frame_idx = 0
+            self.sim_action_buffer = []
+            self.sim_action_index = 0
+            
+            # Initialize Rerun if requested
+            if self.use_rerun:
+                rr.init(f"bimanual_inference/episode_{self.episode_idx}", spawn=True)
+                print("Rerun visualization initialized")
         
         if self.mode == "full_control":
             # Setup leader and follower robots for full control mode
@@ -385,6 +479,11 @@ class BimanualTeleopWithInference:
         if not self.inference_mode:
             return
 
+        # Simulation mode: replay episode with MuJoCo
+        if self.sim:
+            self.run_simulation_inference()
+            return
+
         current_time = time.time()
         
         # Check if we need to run inference (buffer empty or executed required actions)
@@ -472,11 +571,280 @@ class BimanualTeleopWithInference:
             print(f"  Rate: {fps:.2f} Hz")
             self.last_execution_time = current_time
 
+    def run_simulation_inference(self):
+        """Run inference with MuJoCo simulation replay"""
+        if self.sim_frame_idx >= (self.sim_to_idx - self.sim_from_idx):
+            print("🛑 Simulation complete - episode finished")
+            return
+        
+        # Get current frame from dataset
+        dataset_idx = self.sim_from_idx + self.sim_frame_idx
+        sample = self.sim_dataset[int(dataset_idx)]
+        
+        # Set Rerun time if using rerun
+        if self.use_rerun:
+            ts = float(sample.get("timestamp", self.sim_frame_idx / self.sim_fps))
+            rr.set_time_seconds("timestamp", ts)
+        
+        # Get observation from dataset
+        example = {}
+        
+        # Process images
+        image_key_mapping = {
+            'torso': 'observation/images/torso',
+            'teleop_left': 'observation/images/teleop_left',
+            'teleop_right': 'observation/images/teleop_right',
+        }
+        
+        for robot_key, policy_key in image_key_mapping.items():
+            # Try different possible keys
+            for key in [robot_key, f"observation.images.{robot_key}", f"observation/images/{robot_key}"]:
+                if key in sample:
+                    img = sample[key]
+                    if hasattr(img, 'numpy'):
+                        img = img.numpy()
+                    elif hasattr(img, 'cpu'):
+                        img = img.cpu().numpy()
+                    else:
+                        img = np.array(img)
+                    
+                    # Convert to HWC uint8 format
+                    if img.ndim == 3 and img.shape[0] == 3:  # C, H, W
+                        img = np.transpose(img, (1, 2, 0))  # H, W, C
+                    if img.dtype != np.uint8:
+                        if img.max() <= 1.0:
+                            img = (img * 255).astype(np.uint8)
+                        else:
+                            img = img.astype(np.uint8)
+                    
+                    example[policy_key] = img
+                    
+                    # Log image to Rerun
+                    if self.use_rerun:
+                        rr.log(f"dataset/{policy_key}", rr.Image(img))
+                    break
+        
+        # Get state
+        state_key = None
+        for key in ['observation/state', 'observation.state', 'qpos']:
+            if key in sample:
+                state_key = key
+                break
+        
+        if state_key:
+            qpos = sample[state_key]
+            if hasattr(qpos, 'numpy'):
+                qpos = qpos.numpy()
+            elif hasattr(qpos, 'cpu'):
+                qpos = qpos.cpu().numpy()
+            else:
+                qpos = np.array(qpos)
+            example['observation/state'] = qpos.astype(np.float32)
+        
+        # Get prompt/task
+        task_key = None
+        for key in ['task', 'prompt', 'instruction']:
+            if key in sample:
+                task_key = key
+                break
+        
+        if task_key:
+            example['prompt'] = str(sample[task_key])
+        else:
+            example['prompt'] = "Fold the shirt"
+        
+        # Run inference if needed
+        if len(self.sim_action_buffer) == 0 or self.sim_action_index >= self.actions_per_inference:
+            print(f"\n{'='*60}")
+            print(f"Running inference (sim_frame_idx={self.sim_frame_idx})...")
+            
+            result = self.policy.infer(example)
+            actions_batch = result["actions"]
+            
+            self.sim_action_buffer = actions_batch
+            self.sim_action_index = 0
+            print(f"Inference complete: got {actions_batch.shape[0]} actions")
+            print(f"{'='*60}\n")
+        
+        # Get current action from buffer
+        current_action = self.sim_action_buffer[self.sim_action_index]
+        self.sim_action_index += 1
+        
+        # Get ground truth action for comparison
+        u_gt = None
+        if self.use_rerun or self.plot_actions:
+            from lerobot.utils.constants import ACTION
+            if ACTION in sample:
+                u_gt_val = sample[ACTION]
+                if hasattr(u_gt_val, 'numpy'):
+                    u_gt = u_gt_val.numpy()
+                elif hasattr(u_gt_val, 'cpu'):
+                    u_gt = u_gt_val.cpu().numpy()
+                else:
+                    u_gt = np.array(u_gt_val)
+        
+        # Store actions for plotting (always when in sim mode)
+        if self.plot_actions:
+            u_pred = np.asarray(current_action, dtype=np.float32).reshape(-1)
+            if u_gt is not None:
+                u_gt_flat = np.asarray(u_gt, dtype=np.float32).reshape(-1)
+                self.ground_truth_actions.append(u_gt_flat.copy())
+            else:
+                # If no GT available, use zeros as placeholder
+                u_gt_flat = np.zeros_like(u_pred)
+                self.ground_truth_actions.append(u_gt_flat.copy())
+            self.predicted_actions.append(u_pred.copy())
+            ts = float(sample.get("timestamp", self.sim_frame_idx / self.sim_fps))
+            self.action_timestamps.append(ts)
+        
+        # Log actions to Rerun
+        if self.use_rerun and u_gt is not None:
+            u_pred = np.asarray(current_action, dtype=np.float32).reshape(-1)
+            u_gt_flat = np.asarray(u_gt, dtype=np.float32).reshape(-1)
+            n = min(len(u_pred), len(u_gt_flat))
+            for i in range(n):
+                rr.log(f"actions/gt/joint_{i}", rr.Scalars([float(u_gt_flat[i])]))
+                rr.log(f"actions/pred/joint_{i}", rr.Scalars([float(u_pred[i])]))
+        
+        # Apply action to MuJoCo simulation
+        # Reorder: [left(7), right(7)] -> [right(7), left(7)] for MuJoCo
+        if len(current_action) == 14:
+            u_apply = np.concatenate([current_action[7:], current_action[:7]])
+        else:
+            u_apply = current_action
+        
+        self.mj_data.ctrl[:] = u_apply
+        
+        # Calculate number of simulation steps until next frame
+        if dataset_idx + 1 < self.sim_to_idx:
+            sample_next = self.sim_dataset[int(dataset_idx + 1)]
+            ts = float(sample.get("timestamp", 0))
+            ts_next = float(sample_next.get("timestamp", ts + 1.0 / self.sim_fps))
+        else:
+            ts = float(sample.get("timestamp", 0))
+            ts_next = ts + 1.0 / max(1.0, self.sim_fps)
+        
+        n_steps = max(1, int(round((ts_next - ts) / self.sim_dt)))
+        
+        # Step simulation
+        for _ in range(n_steps):
+            mujoco.mj_step(self.mj_model, self.mj_data)
+        
+        # Render and log to Rerun if enabled
+        if self.use_rerun:
+            # Try to create renderer for this frame if not already created
+            if self.mj_renderer is None:
+                try:
+                    self.mj_renderer = mujoco.Renderer(self.mj_model, height=480, width=640)
+                    self.use_renderer = True
+                except Exception:
+                    self.use_renderer = False
+            
+            if self.use_renderer and self.mj_renderer is not None:
+                try:
+                    self.mj_renderer.update_scene(self.mj_data, camera=0)
+                    sim_image = self.mj_renderer.render()
+                    rr.log("sim", rr.Image(sim_image))
+                except Exception:
+                    # Silently fail if rendering has issues
+                    pass
+        
+        # Print action
+        print(f"Sim step {self.sim_frame_idx}: Action applied, {n_steps} sim steps")
+        
+        # Advance frame
+        self.sim_frame_idx += 1
+    
+    def plot_action_comparison(self):
+        """Plot predicted vs ground truth actions and save to plots directory"""
+        if not self.plot_actions or len(self.predicted_actions) == 0:
+            return
+        
+        predicted = np.array(self.predicted_actions)
+        ground_truth = np.array(self.ground_truth_actions)
+        timestamps = np.array(self.action_timestamps)
+        
+        # Normalize timestamps to start from 0
+        if len(timestamps) > 0:
+            timestamps = timestamps - timestamps[0]
+        
+        n_joints = min(predicted.shape[1], ground_truth.shape[1])
+        
+        # Joint names for bimanual robot (7 joints per arm)
+        joint_names = [
+            'j0 (shoulder_pan)', 'j1 (shoulder_lift)', 'j2 (elbow)', 
+            'j3 (wrist_1)', 'j4 (wrist_2)', 'j5 (wrist_3)', 'j6 (gripper)'
+        ]
+        
+        # Split into left and right arms (assuming 14 joints total: 7 left + 7 right)
+        n_joints_per_arm = 7
+        left_arm_joints = min(n_joints_per_arm, n_joints // 2)
+        right_arm_joints = min(n_joints_per_arm, n_joints - left_arm_joints)
+        
+        # Create figure with 2 columns: left arm and right arm
+        fig = plt.figure(figsize=(16, 2 * max(left_arm_joints, right_arm_joints)))
+        fig.suptitle(f'Predicted vs Ground Truth Actions - Episode {self.episode_idx}', fontsize=16, y=0.995)
+        
+        # Left arm plots (left column)
+        for i in range(left_arm_joints):
+            ax = plt.subplot(max(left_arm_joints, right_arm_joints), 2, 2 * i + 1)
+            ax.plot(timestamps, predicted[:, i], label='Predicted', alpha=0.7, linewidth=1.5, color='blue')
+            ax.plot(timestamps, ground_truth[:, i], label='Ground Truth', alpha=0.7, linewidth=1.5, linestyle='--', color='orange')
+            ax.set_ylabel(f'Left {joint_names[i]}\n(rad)', fontsize=10)
+            ax.legend(loc='upper right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+            if i < left_arm_joints - 1:
+                ax.set_xticklabels([])
+            else:
+                ax.set_xlabel('Time (s)', fontsize=10)
+        
+        # Right arm plots (right column)
+        for i in range(right_arm_joints):
+            ax = plt.subplot(max(left_arm_joints, right_arm_joints), 2, 2 * i + 2)
+            right_idx = left_arm_joints + i
+            ax.plot(timestamps, predicted[:, right_idx], label='Predicted', alpha=0.7, linewidth=1.5, color='blue')
+            ax.plot(timestamps, ground_truth[:, right_idx], label='Ground Truth', alpha=0.7, linewidth=1.5, linestyle='--', color='orange')
+            ax.set_ylabel(f'Right {joint_names[i]}\n(rad)', fontsize=10)
+            ax.legend(loc='upper right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+            if i < right_arm_joints - 1:
+                ax.set_xticklabels([])
+            else:
+                ax.set_xlabel('Time (s)', fontsize=10)
+        
+        # Add column titles
+        fig.text(0.25, 0.98, 'Left Arm', ha='center', fontsize=12, weight='bold')
+        fig.text(0.75, 0.98, 'Right Arm', ha='center', fontsize=12, weight='bold')
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        
+        # Save plot to plots directory
+        plot_filename = self.plots_dir / f'action_comparison_episode_{self.episode_idx}.png'
+        plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+        print(f"✓ Action comparison plot saved to: {plot_filename}")
+        
+        # Close figure to free memory
+        plt.close(fig)
     
     def run(self):
         """Run the main control loop"""
         try:
-            if self.mode == "observation_only":
+            if self.sim:
+                # Simulation mode: automatically enable inference and run until episode ends
+                print("🤖 Starting simulation replay...")
+                self.inference_mode = True
+                while self.sim_frame_idx < (self.sim_to_idx - self.sim_from_idx):
+                    self.run_inference()
+                    time.sleep(0.01)  # Small delay for visualization
+                print("✓ Simulation replay complete")
+                
+                # Automatically plot actions when in simulation mode
+                if self.plot_actions:
+                    print("Generating action comparison plot...")
+                    self.plot_action_comparison()
+                
+                return
+            elif self.mode == "observation_only":
                 # Automatically enable inference mode (no button required)
                 if not self.inference_mode:
                     print("🤖 Auto-enabling INFERENCE mode (observation-only mode)")
@@ -519,33 +887,55 @@ def main():
     parser.add_argument('--mode', type=str, default=DEFAULT_MODE,
                         choices=['observation_only', 'full_control'],
                         help='Mode to run: "observation_only" (no actuation, just print actions) or "full_control" (full robot control with buttons)')
+    parser.add_argument('--sim', action='store_true', 
+                        help='Enable MuJoCo simulation replay mode')
+    parser.add_argument('--mjcf_path', type=str, default=None,
+                        help='Path to MuJoCo XML file (required if --sim)')
+    parser.add_argument('--dataset_dir', type=str, default=None,
+                        help='Path to dataset directory or repo_id (required if --sim)')
+    parser.add_argument('--episode_idx', type=int, default=0,
+                        help='Episode index to replay (default: 0)')
+    parser.add_argument('--use_rerun', action='store_true',
+                        help='Use Rerun for visualization (requires rerun package)')
     args = parser.parse_args()
     
     mode = args.mode
+    sim = args.sim
     processes = []
     controller = None
     
     try:
-        # Always start follower processes - needed for observations in both modes
-        print("Launching follower processes...")
-        follower_configs = [
-            {'can_channel': 'can_follower_r', 'gripper': 'linear_4310', 'server_port': 1234},
-            {'can_channel': 'can_follower_l', 'gripper': 'linear_4310', 'server_port': 1235}
-        ]
+        # Skip follower processes if in simulation mode
+        if not sim:
+            # Always start follower processes - needed for observations in both modes
+            print("Launching follower processes...")
+            follower_configs = [
+                {'can_channel': 'can_follower_r', 'gripper': 'linear_4310', 'server_port': 1234},
+                {'can_channel': 'can_follower_l', 'gripper': 'linear_4310', 'server_port': 1235}
+            ]
+            
+            for config in follower_configs:
+                process = launch_gello_process(**config)
+                if process:
+                    processes.append(process)
+                    print(f"✓ Started follower process {process.pid} for {config['can_channel']}")
+                else:
+                    raise RuntimeError(f"Failed to start follower process for {config['can_channel']}")
+            
+            print(f"✓ Successfully launched {len(processes)} follower processes")
+            print("Waiting for processes to initialize...")
+            time.sleep(3)
         
-        for config in follower_configs:
-            process = launch_gello_process(**config)
-            if process:
-                processes.append(process)
-                print(f"✓ Started follower process {process.pid} for {config['can_channel']}")
-            else:
-                raise RuntimeError(f"Failed to start follower process for {config['can_channel']}")
-        
-        print(f"✓ Successfully launched {len(processes)} follower processes")
-        print("Waiting for processes to initialize...")
-        time.sleep(3)
-        
-        if mode == "observation_only":
+        if sim:
+            print("="*60)
+            print("SIMULATION MODE - MuJoCo REPLAY")
+            print("="*60)
+            print("This script will:")
+            print("  1. Load episode from dataset")
+            print("  2. Run inference on each frame")
+            print("  3. Apply actions to MuJoCo simulation")
+            print("="*60)
+        elif mode == "observation_only":
             print("="*60)
             print("OBSERVATION-ONLY MODE - NO ROBOT ACTUATION")
             print("="*60)
@@ -570,6 +960,11 @@ def main():
             checkpoint_dir=checkpoint_dir,
             bilateral_kp=0.0,  # Set to > 0 for bilateral force feedback
             mode=mode,
+            sim=sim,
+            mjcf_path=args.mjcf_path,
+            dataset_dir=args.dataset_dir,
+            episode_idx=args.episode_idx,
+            use_rerun=args.use_rerun,
         )
 
         # Run main control loop
