@@ -838,8 +838,8 @@ class BimanualTeleopWithInference:
                 ax.set_xlabel('Time (s)', fontsize=10)
         
         # Add column titles
-        fig.text(0.25, 0.98, 'Left Arm', ha='center', fontsize=12, weight='bold')
-        fig.text(0.75, 0.98, 'Right Arm', ha='center', fontsize=12, weight='bold')
+        fig.text(0.25, 0.98, 'Right Arm', ha='center', fontsize=12, weight='bold')
+        fig.text(0.75, 0.98, 'Left Arm', ha='center', fontsize=12, weight='bold')
         
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         
