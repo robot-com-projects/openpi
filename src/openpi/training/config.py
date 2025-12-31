@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.i2rt_policy as i2rt_policy
+import openpi.policies.soarm101_policy as soarm101_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -355,6 +356,69 @@ class LeRobotI2RTDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,)
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSoarm101DataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For soarm101 dataset, following the same pattern as i2rt.
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for soarm101).
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # Map dataset keys to output keys (keep image keys as-is since Soarm101Inputs expects them)
+                        # Note: flatten_dict uses / separator, but dataset keys use . separator
+                        # Since dataset returns flat keys with ., flatten_dict keeps them as-is
+                        "observation/images/front": "observation.images.front",
+                        "observation/images/side": "observation.images.side",
+                        "observation/state": "observation.state",
+                        "actions": "action",  # Dataset has "action" (singular), map to "actions" (plural)
+                        "prompt": "task",  # Dataset has "task" field, map to "prompt"
+                    }
+                )
+            ]
+        )
+
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        data_transforms = _transforms.Group(
+            inputs=[soarm101_policy.Soarm101Inputs(model_type=model_config.model_type)],
+            outputs=[soarm101_policy.Soarm101Outputs()],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
@@ -759,6 +823,53 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(action_horizon=10),
         data=LeRobotI2RTDataConfig(
             repo_id="act_pick_and_place/double_merged",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+    ),
+    # Fine-tuning Soarm101 configs.
+    TrainConfig(
+        name="pi05_soarm101",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotSoarm101DataConfig(
+            repo_id="zetanschy/battery_pick_and_place",  # Replace with your dataset repo_id
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_soarm101_lora",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotSoarm101DataConfig(
+            repo_id="zetanschy/battery_pick_and_place",  # Replace with your dataset repo_id
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Inference Soarm101 configs.
+    TrainConfig(
+        name="pi0_soarm101",
+        model=pi0_config.Pi0Config(action_horizon=10),
+        data=LeRobotSoarm101DataConfig(
+            repo_id="zetanschy/battery_pick_and_place",  # Replace with your dataset repo_id
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),

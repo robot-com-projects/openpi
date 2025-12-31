@@ -74,7 +74,7 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "292333cafcbddf7c77aaed0bc5569ba37083ac7f" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "5edaa4691567873d495633f2708982b42edf1972" }
-i2rt = { path = "/home/i2rt/robot-os/thirdparty/i2rt" }  # Adjust path as needed
+i2rt = { git = "https://github.com/robot-com-projects/i2rt" }  # path = "/home/i2rt/robot-os/thirdparty/i2rt"
 
 [tool.uv.workspace]
 members = ["packages/*"]
