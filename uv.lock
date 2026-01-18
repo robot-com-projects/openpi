@@ -983,7 +983,7 @@ wheels = [
 [[package]]
 name = "i2rt"
 version = "0.0.1"
-source = { directory = "../robot-os/thirdparty/i2rt" }
+source = { git = "https://github.com/robot-com-projects/i2rt#bc6edcb387bc4e85d82236a141cf5648d6790f49" }
 dependencies = [
     { name = "click" },
     { name = "dm-env" },
@@ -998,24 +998,6 @@ dependencies = [
     { name = "threadpoolctl" },
     { name = "tyro" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = "<8.2.0" },
-    { name = "dm-env", specifier = "==1.6" },
-    { name = "evdev", marker = "sys_platform == 'linux'", specifier = "==1.9.2" },
-    { name = "mujoco", specifier = "==3.3.5" },
-    { name = "numpy", specifier = "==2.2.6" },
-    { name = "portal", specifier = "==3.7.3" },
-    { name = "pygame", specifier = "==2.6.1" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = "==8.4.0" },
-    { name = "python-can", specifier = "==4.5.0" },
-    { name = "qpsolvers", extras = ["quadprog"], specifier = "==4.7.1" },
-    { name = "ruckig", specifier = "==0.15.3" },
-    { name = "threadpoolctl", specifier = "==3.6.0" },
-    { name = "tyro", specifier = "==0.9.26" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "identify"
@@ -1992,7 +1974,7 @@ requires-dist = [
     { name = "flax", specifier = "==0.10.2" },
     { name = "fsspec", extras = ["gcs"], specifier = ">=2024.6.0" },
     { name = "gym-aloha", specifier = ">=0.1.1" },
-    { name = "i2rt", directory = "../robot-os/thirdparty/i2rt" },
+    { name = "i2rt", git = "https://github.com/robot-com-projects/i2rt" },
     { name = "imageio", specifier = ">=2.36.1" },
     { name = "jax", extras = ["cuda12"], specifier = "==0.5.3" },
     { name = "jaxtyping", specifier = "==0.2.36" },
