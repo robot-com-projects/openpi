@@ -9,24 +9,6 @@ This script:
 3. Runs inference using openpi.policies with OpenPiPolicyAdapter
 4. Publishes joint commands via ROS2 (Isaac Sim subscribes and executes)
 
-NOTE: This script does NOT require Isaac Sim to be installed in the same environment.
-      Isaac Sim runs on the host and communicates via ROS2 topics.
-
-Usage:
-    1. Start Isaac Sim on host with ROS2 bridge enabled
-    2. Ensure the USD file has cameras configured and publishing to ROS2 topics
-    3. Run the script:
-       python3 isaac_sim_inference.py --config-name <config_name> --checkpoint-dir <checkpoint_dir>
-    
-    Required arguments:
-      --config-name: Policy config name (e.g., 'pi0_i2rt_lora')
-      --checkpoint-dir: Path to checkpoint directory
-    
-    Optional arguments:
-      --execution-hz: Action execution frequency (default: 30.0)
-      --max-actions-per-inference: Actions to execute before next inference (default: 25)
-      --action-diff-threshold: Maximum change per action step in radians (default: 0.1)
-
 Example:
     python3 isaac_sim_inference.py \
         --config-name pi05_i2rt_lora \
@@ -104,10 +86,17 @@ POLICY_IMAGE_KEYS = {
     'teleop_right': 'observation/images/teleop_right',
 }
 
-# Joint names for the bimanual robot (14 DOF: 7 per arm)
+# Joint names for the bimanual robot (16 DOF: interleaved left/right)
+# Order matches Isaac Sim: left1, right1, left2, right2, ..., left6, right6, then fingers
 JOINT_NAMES = [
-    'left_joint1', 'left_joint2', 'left_joint3', 'left_joint4', 'left_joint5', 'left_joint6', 'left_left_finger', 'left_right_finger',
-    'right_joint1', 'right_joint2', 'right_joint3', 'right_joint4', 'right_joint5', 'right_joint6', 'right_left_finger', 'right_right_finger'
+    'left_joint1', 'right_joint1',
+    'left_joint2', 'right_joint2',
+    'left_joint3', 'right_joint3',
+    'left_joint4', 'right_joint4',
+    'left_joint5', 'right_joint5',
+    'left_joint6', 'right_joint6',
+    'left_left_finger', 'left_right_finger',
+    'right_left_finger', 'right_right_finger'
 ]
 
 # =======================================================
@@ -195,14 +184,8 @@ class ROS2InferenceNode(Node):
                 self.joint_names_received = list(msg.name)
                 self.get_logger().info(f"Received joint names: {self.joint_names_received}")
             
-            # Convert to numpy array with 14 DOF
+            # Convert to numpy array with 16 DOF (12 arm joints interleaved + 4 finger joints)
             positions = np.array(msg.position, dtype=np.float32)
-            
-            # Ensure we have 14 DOF (7 per arm)
-            if len(positions) < 14:
-                positions = np.pad(positions, (0, 14 - len(positions)))
-            elif len(positions) > 14:
-                positions = positions[:14]
             
             self.current_joint_positions = positions
         except Exception as e:
@@ -240,7 +223,6 @@ class ROS2InferenceNode(Node):
         msg.effort = []
         
         self.joint_command_pub.publish(msg)
-        print("Target positions: ", target_positions)
     
     def _execute_action(self, action: np.ndarray):
         """
@@ -258,40 +240,11 @@ class ROS2InferenceNode(Node):
         
         action_len = len(action)
         self.get_logger().debug(f"Action shape: {action.shape}, length: {action_len}")
-        
-        # Determine action format and extract components
-        # Assume format: [left_arm_joints, left_gripper, right_arm_joints, right_gripper]
-        # Most common: 14 values = 7 left + 7 right (where last of each might be gripper)
-        # Or: 16 values = 6 left + 2 left_gripper + 6 right + 2 right_gripper
-        
-        if action_len == 14:
-            # Format: [left_arm_7, right_arm_7]
-            # Assume last value of each arm is gripper (0-1 normalized)
-            target_left_arm = action[:6]  # First 6 arm joints
-            left_gripper_val = action[6]  # Single gripper value 0-1
-            target_right_arm = action[7:13]  # Next 6 arm joints
-            right_gripper_val = action[13]  # Single gripper value 0-1
-        elif action_len == 16:
-            # Format: [left_arm_6, left_gripper_2, right_arm_6, right_gripper_2]
-            target_left_arm = action[:6]
-            left_gripper_val = action[6:8]  # 2 values
-            target_right_arm = action[8:14]
-            right_gripper_val = action[14:16]  # 2 values
-        elif action_len == 18:
-            # Format: [left_arm_7, left_gripper_2, right_arm_7, right_gripper_2]
-            target_left_arm = action[:7]
-            left_gripper_val = action[7:9]
-            target_right_arm = action[9:16]
-            right_gripper_val = action[16:18]
-        else:
-            self.get_logger().warn(
-                f"Unexpected action length: {action_len}. "
-                f"Assuming 14 values (7 per arm, last is gripper)"
-            )
-            target_left_arm = action[:6]
-            left_gripper_val = action[6] if action_len > 6 else 0.0
-            target_right_arm = action[7:13] if action_len > 13 else action[7:]
-            right_gripper_val = action[13] if action_len > 13 else 0.0
+        # Swap: Policy's left -> Isaac's right, Policy's right -> Isaac's left
+        target_right_arm = action[:6]  # Policy's left -> Isaac's right
+        right_gripper_val = action[6]  # Policy's left gripper -> Isaac's right gripper
+        target_left_arm = action[7:13]  # Policy's right -> Isaac's left
+        left_gripper_val = action[13]  # Policy's right gripper -> Isaac's left gripper
         
         # Get current arm joint positions (exclude gripper fingers from joint_names_received)
         # Find where gripper fingers start in joint names
@@ -306,55 +259,85 @@ class ROS2InferenceNode(Node):
             gripper_start_idx = len(self.joint_names_received) - 4
         
         num_arm_joints = gripper_start_idx
-        current_left_arm = self.current_joint_positions[:num_arm_joints//2]
-        current_right_arm = self.current_joint_positions[num_arm_joints//2:num_arm_joints]
+        
+        # De-interleave joints: Isaac Sim sends [left1, right1, left2, right2, ...]
+        # Extract left and right arm positions separately
+        current_left_arm = []
+        current_right_arm = []
+        for i in range(0, num_arm_joints, 2):
+            if i < len(self.current_joint_positions):
+                current_left_arm.append(self.current_joint_positions[i])  # Isaac's "left"
+            if i + 1 < len(self.current_joint_positions):
+                current_right_arm.append(self.current_joint_positions[i + 1])  # Isaac's "right"
+        
+        current_left_arm = np.array(current_left_arm, dtype=np.float32)
+        current_right_arm = np.array(current_right_arm, dtype=np.float32)
+        
+        # Ensure target arrays are numpy arrays
+        target_left_arm = np.array(target_left_arm, dtype=np.float32)
+        target_right_arm = np.array(target_right_arm, dtype=np.float32)
         
         # Limit target and current positions difference to prevent large jumps
-        min_len = min(len(target_left_arm), len(current_left_arm))
-        diff_left = target_left_arm[:min_len] - current_left_arm[:min_len]
-        diff_left = np.clip(diff_left, -self.action_diff_threshold, self.action_diff_threshold)
-        target_left_arm = current_left_arm[:min_len] + diff_left
+        # Ensure both arrays have the same length for the operation
+        min_len_left = min(len(target_left_arm), len(current_left_arm))
+        if len(target_left_arm) < len(current_left_arm):
+            # Pad target_left_arm with current values
+            target_left_arm = np.concatenate([target_left_arm, current_left_arm[len(target_left_arm):]])
+        elif len(current_left_arm) < len(target_left_arm):
+            # Truncate target_left_arm
+            target_left_arm = target_left_arm[:len(current_left_arm)]
         
-        min_len = min(len(target_right_arm), len(current_right_arm))
-        diff_right = target_right_arm[:min_len] - current_right_arm[:min_len]
+        diff_left = target_left_arm - current_left_arm
+        diff_left = np.clip(diff_left, -self.action_diff_threshold, self.action_diff_threshold)
+        target_left_arm = current_left_arm + diff_left
+        
+        min_len_right = min(len(target_right_arm), len(current_right_arm))
+        if len(target_right_arm) < len(current_right_arm):
+            # Pad target_right_arm with current values
+            target_right_arm = np.concatenate([target_right_arm, current_right_arm[len(target_right_arm):]])
+        elif len(current_right_arm) < len(target_right_arm):
+            # Truncate target_right_arm
+            target_right_arm = target_right_arm[:len(current_right_arm)]
+        
+        diff_right = target_right_arm - current_right_arm
         diff_right = np.clip(diff_right, -self.action_diff_threshold, self.action_diff_threshold)
-        target_right_arm = current_right_arm[:min_len] + diff_right
+        target_right_arm = current_right_arm + diff_right
         
         # Convert gripper values (0-1) to finger positions
-        # 0 = open (fingers apart), 1 = closed (fingers together)
-        # Typical finger positions for Isaac Sim: open = 0.04/-0.04, closed = 0.0/0.0
-        GRIPPER_OPEN_LEFT_FINGER = 0.04
-        GRIPPER_OPEN_RIGHT_FINGER = -0.04
-        GRIPPER_CLOSED = 0.0
+        # Only command left finger (right finger is mimic joint)
+        # Range: -0.002 (open) to 0.038 (closed)
+        GRIPPER_OPEN = -0.002
+        GRIPPER_CLOSED = 0.038
         
-        # Map 0-1 to finger positions (linear interpolation)
-        # If single value, apply to both fingers symmetrically
+        # Map 0-1 to finger position (linear interpolation)
+        # 0 = open, 1 = closed
         if isinstance(left_gripper_val, (int, float)) or (isinstance(left_gripper_val, np.ndarray) and left_gripper_val.size == 1):
             val = float(left_gripper_val) if isinstance(left_gripper_val, np.ndarray) else left_gripper_val
-            # 0 = open, 1 = closed
-            left_finger_left = GRIPPER_CLOSED + (GRIPPER_OPEN_LEFT_FINGER - GRIPPER_CLOSED) * (1 - val)
-            left_finger_right = GRIPPER_CLOSED + (GRIPPER_OPEN_RIGHT_FINGER - GRIPPER_CLOSED) * (1 - val)
+            left_finger_left = GRIPPER_OPEN + (GRIPPER_CLOSED - GRIPPER_OPEN) * val
         else:
-            # 2 values
-            left_finger_left = GRIPPER_CLOSED + (GRIPPER_OPEN_LEFT_FINGER - GRIPPER_CLOSED) * (1 - left_gripper_val[0])
-            left_finger_right = GRIPPER_CLOSED + (GRIPPER_OPEN_RIGHT_FINGER - GRIPPER_CLOSED) * (1 - left_gripper_val[1])
+            # Use first value if array
+            left_finger_left = GRIPPER_OPEN + (GRIPPER_CLOSED - GRIPPER_OPEN) * float(left_gripper_val[0])
         
         if isinstance(right_gripper_val, (int, float)) or (isinstance(right_gripper_val, np.ndarray) and right_gripper_val.size == 1):
             val = float(right_gripper_val) if isinstance(right_gripper_val, np.ndarray) else right_gripper_val
-            right_finger_left = GRIPPER_CLOSED + (GRIPPER_OPEN_LEFT_FINGER - GRIPPER_CLOSED) * (1 - val)
-            right_finger_right = GRIPPER_CLOSED + (GRIPPER_OPEN_RIGHT_FINGER - GRIPPER_CLOSED) * (1 - val)
+            right_finger_left = GRIPPER_OPEN + (GRIPPER_CLOSED - GRIPPER_OPEN) * val
         else:
-            # 2 values
-            right_finger_left = GRIPPER_CLOSED + (GRIPPER_OPEN_LEFT_FINGER - GRIPPER_CLOSED) * (1 - right_gripper_val[0])
-            right_finger_right = GRIPPER_CLOSED + (GRIPPER_OPEN_RIGHT_FINGER - GRIPPER_CLOSED) * (1 - right_gripper_val[1])
+            # Use first value if array
+            right_finger_left = GRIPPER_OPEN + (GRIPPER_CLOSED - GRIPPER_OPEN) * float(right_gripper_val[0])
         
-        # Combine: left_arm + left_fingers + right_arm + right_fingers
-        target_positions = np.concatenate([
-            target_left_arm,
-            [left_finger_left, left_finger_right],
-            target_right_arm,
-            [right_finger_left, right_finger_right]
-        ])
+        # Combine in interleaved order for Isaac Sim: left1, right1, left2, right2, ...
+        num_joints = min(len(target_left_arm), len(target_right_arm), 6)
+        interleaved_arm = []
+        for i in range(num_joints):
+            interleaved_arm.append(target_left_arm[i])   # Isaac's "left"
+            interleaved_arm.append(target_right_arm[i])  # Isaac's "right"
+        
+        # Add fingers: left_left, left_right (mimic), right_left, right_right (mimic)
+        # Only command left finger, right finger is handled by mimic joint
+        target_positions = np.array(interleaved_arm + [
+            left_finger_left, 0.0,   # Isaac's "left" fingers: command left, right is mimic
+            right_finger_left, 0.0   # Isaac's "right" fingers: command left, right is mimic
+        ], dtype=np.float32)
         
         self._publish_joint_command(target_positions)
     
@@ -388,9 +371,51 @@ class ROS2InferenceNode(Node):
                     img = self._robot_obs_to_numpy(self.images[robot_key])
                     images[policy_key] = img
             
+            # Convert joint positions from 16-element interleaved format to 14-element format
+            # Policy expects: [left_arm_6, left_gripper_1, right_arm_6, right_gripper_1] = 14 elements
+            # Current format: [left1, right1, left2, right2, ..., left6, right6, left_fingers_2, right_fingers_2] = 16 elements
+            
+            # Extract left and right arm joints (first 12 elements are interleaved arm joints)
+            left_arm_joints = []
+            right_arm_joints = []
+            for i in range(0, 12, 2):
+                if i < len(self.current_joint_positions):
+                    left_arm_joints.append(self.current_joint_positions[i])  # Isaac's "left"
+                if i + 1 < len(self.current_joint_positions):
+                    right_arm_joints.append(self.current_joint_positions[i + 1])  # Isaac's "right"
+            
+            # Convert finger positions to 2 gripper values (one per arm)
+            # Only read left finger (right finger is mimic joint)
+            # Range: -0.002 (open) to 0.038 (closed)
+            GRIPPER_OPEN = -0.002
+            GRIPPER_CLOSED = 0.038
+            
+            if len(self.current_joint_positions) >= 16:
+                left_left_finger = self.current_joint_positions[12]   # Isaac's "left_left"
+                right_left_finger = self.current_joint_positions[14]   # Isaac's "right_left"
+                
+                # Convert finger position to normalized gripper value (0 = open, 1 = closed)
+                left_gripper_val = (left_left_finger - GRIPPER_OPEN) / (GRIPPER_CLOSED - GRIPPER_OPEN)
+                left_gripper_val = np.clip(left_gripper_val, 0.0, 1.0)
+                
+                right_gripper_val = (right_left_finger - GRIPPER_OPEN) / (GRIPPER_CLOSED - GRIPPER_OPEN)
+                right_gripper_val = np.clip(right_gripper_val, 0.0, 1.0)
+            else:
+                left_gripper_val = 0.0
+                right_gripper_val = 0.0
+            
+            # Combine to 14-element format for policy: [policy_left_arm_6, policy_left_gripper_1, policy_right_arm_6, policy_right_gripper_1]
+            # Swap: Isaac's left -> policy's right, Isaac's right -> policy's left
+            policy_state = np.concatenate([
+                np.array(right_arm_joints, dtype=np.float32),  # Isaac's right -> policy's left
+                np.array([right_gripper_val], dtype=np.float32),
+                np.array(left_arm_joints, dtype=np.float32),   # Isaac's left -> policy's right
+                np.array([left_gripper_val], dtype=np.float32)
+            ])
+            
             # Get joint positions (using slash format as expected by openpi policies)
             states = {
-                'observation/state': self.current_joint_positions
+                'observation/state': policy_state
             }
             
             # Run inference
@@ -411,9 +436,9 @@ class ROS2InferenceNode(Node):
             
             if self.last_execution_time > 0:
                 fps = 1.0 / (current_time - self.last_execution_time)
-                # self.get_logger().info(
-                #     f"Executed action {self.action_index}/{self.max_actions_per_inference} | fps: {fps:.1f}"
-                # )
+                self.get_logger().info(
+                    f"Executed action {self.action_index}/{self.max_actions_per_inference} | fps: {fps:.1f}"
+                )
             
             self.last_execution_time = current_time
 
@@ -450,7 +475,7 @@ def main():
                         help='Action execution frequency in Hz (default: 30.0)')
     parser.add_argument('--max-actions-per-inference', type=int, default=25,
                         help='Number of actions to execute before next inference (default: 25)')
-    parser.add_argument('--action-diff-threshold', type=float, default=0.1,
+    parser.add_argument('--action-diff-threshold', type=float, default=0.2,
                         help='Maximum change per action step in radians (default: 0.1)')
     
     args = parser.parse_args()
